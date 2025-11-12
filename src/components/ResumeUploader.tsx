@@ -1,137 +1,119 @@
-import React, { useCallback, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
+// src/components/ResumeUploader.tsx
+import React, { useState } from "react";
 
-type Props = {
-  onFilesChange?: (files: File[]) => void;
-  accept?: string[];          // default: ['application/pdf']
-  multiple?: boolean;         // default: true
-  maxFiles?: number;          // default: 50
-  maxSizeMB?: number;         // default: 10
-  className?: string;
+type UploadResult = {
+  success?: boolean;
+  score?: number;
+  matched?: string[];
+  resume?: { file_url?: string };
+  error?: string;
 };
 
-const formatBytes = (bytes: number) => {
-  if (bytes === 0) return "0 B";
-  const k = 1024, sizes = ["B", "KB", "MB", "GB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
-};
+interface Props {
+  jdId?: string; // pass a real JD id or leave empty and replace below
+}
 
-export default function ResumeUploader({
-  onFilesChange,
-  accept = ["application/pdf"],
-  multiple = true,
-  maxFiles = 50,
-  maxSizeMB = 10,
-  className,
-}: Props) {
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const [files, setFiles] = useState<File[]>([]);
-  const [dragOver, setDragOver] = useState(false);
+const ResumeUploader: React.FC<Props> = ({ jdId }) => {
+  const [file, setFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<UploadResult | null>(null);
 
-  const acceptAttr = accept.join(",");
+  // If you don't pass jdId as prop, put a real JD id here (from Supabase job_descriptions table)
+  const JD_ID = jdId || "replace_with_real_jd_id_from_supabase";
 
-  const applyFiles = (incoming: File[]) => {
-    // Filters
-    const allowed = incoming.filter(f => {
-      const typeOk = accept.includes(f.type) || accept.some(a => a === ".pdf" && f.name.toLowerCase().endsWith(".pdf"));
-      const sizeOk = f.size <= maxSizeMB * 1024 * 1024;
-      return typeOk && sizeOk;
-    });
+  async function handleUpload(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    if (!file) {
+      alert("Please select a PDF or DOCX file first.");
+      return;
+    }
+    if (!JD_ID || JD_ID === "replace_with_real_jd_id_from_supabase") {
+      alert("Please set a valid job description id (jdId).");
+      return;
+    }
 
-    // merge (no duplicates by name+size)
-    const merged = [...files, ...allowed].filter((f, idx, arr) =>
-      arr.findIndex(g => g.name === f.name && g.size === f.size) === idx
-    );
+    const fd = new FormData();
+    fd.append("resume", file);
+    fd.append("jd_id", JD_ID);
 
-    const limited = merged.slice(0, maxFiles);
-    setFiles(limited);
-    onFilesChange?.(limited);
-  };
+    try {
+      setLoading(true);
+      setResult(null);
 
-  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const list = Array.from(e.target.files || []);
-    applyFiles(list);
-    if (inputRef.current) inputRef.current.value = ""; // reset input
-  };
+      const resp = await fetch("http://localhost:4000/upload-resume", {
+        method: "POST",
+        body: fd,
+      });
 
-  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    const items = Array.from(e.dataTransfer.files || []);
-    applyFiles(items);
-  };
-
-  const removeAt = (i: number) => {
-    const next = files.filter((_, idx) => idx !== i);
-    setFiles(next);
-    onFilesChange?.(next);
-  };
-
-  const clearAll = () => {
-    setFiles([]);
-    onFilesChange?.([]);
-  };
-
-  const openPicker = useCallback(() => inputRef.current?.click(), []);
+      // If server returned non-JSON, this may throw — handle gracefully
+      const data = await resp.json();
+      setResult(data);
+    } catch (err) {
+      console.error("Upload error:", err);
+      setResult({ error: "Upload failed. Check backend is running and CORS." });
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
-    <div className={cn("space-y-3", className)}>
-      {/* Drop zone */}
-      <div
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
-        className={cn(
-          "w-full rounded-2xl border border-dashed p-6 text-center transition",
-          dragOver ? "border-primary bg-primary/5" : "border-muted-foreground/30"
-        )}
-      >
-        <input
-          ref={inputRef}
-          type="file"
-          accept={acceptAttr}
-          multiple={multiple}
-          onChange={onPick}
-          className="hidden"
-        />
-        <p className="text-sm text-muted-foreground">
-          Drag & drop PDFs here, or
-        </p>
-        <div className="mt-2 flex items-center justify-center gap-2">
-          <Button size="sm" onClick={openPicker}>Choose PDF(s)</Button>
-          <Badge variant="secondary">{files.length}/{maxFiles}</Badge>
-        </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          Allowed: PDF • Max size: {maxSizeMB} MB per file
-        </p>
-      </div>
+    <div style={{ maxWidth: 600, margin: "30px auto", padding: 16, border: "1px solid #ddd", borderRadius: 8 }}>
+      <h2 style={{ marginBottom: 12 }}>Upload Resume for Automatic Shortlisting</h2>
 
-      {/* Selected list */}
-      {files.length > 0 && (
-        <div className="rounded-xl border p-3">
-          <div className="mb-2 flex items-center justify-between">
-            <p className="text-sm font-medium">Selected files</p>
-            <Button variant="ghost" size="sm" onClick={clearAll}>Clear all</Button>
-          </div>
-          <ul className="space-y-2">
-            {files.map((f, i) => (
-              <li key={`${f.name}-${i}`} className="flex items-center justify-between rounded-md bg-muted/40 px-3 py-2">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium">{f.name}</p>
-                  <p className="text-xs text-muted-foreground">{formatBytes(f.size)}</p>
+      <form onSubmit={handleUpload}>
+        <input
+          type="file"
+          accept=".pdf,.docx"
+          onChange={(e) => setFile(e.target.files?.[0] || null)}
+          style={{ display: "block", marginBottom: 12 }}
+        />
+
+        <button
+          type="submit"
+          disabled={loading}
+          style={{
+            padding: "8px 14px",
+            background: "#2563eb",
+            color: "white",
+            border: "none",
+            borderRadius: 6,
+            cursor: loading ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading ? "Uploading..." : "Upload & Get Score"}
+        </button>
+      </form>
+
+      {/* Result area */}
+      {result && (
+        <div style={{ marginTop: 18 }}>
+          {result.success ? (
+            <div>
+              <div style={{ color: "green", fontWeight: 600 }}>✅ Resume Analyzed</div>
+              <div style={{ marginTop: 8 }}><strong>Score:</strong> {result.score}</div>
+              <div style={{ marginTop: 6 }}>
+                <strong>Matched Skills:</strong>{" "}
+                {result.matched && result.matched.length ? result.matched.join(", ") : "None"}
+              </div>
+              {result.resume?.file_url && (
+                <div style={{ marginTop: 8 }}>
+                  <a href={result.resume.file_url} target="_blank" rel="noreferrer">View uploaded file</a>
                 </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline">PDF</Badge>
-                  <Button variant="ghost" size="sm" onClick={() => removeAt(i)}>Remove</Button>
-                </div>
-              </li>
-            ))}
-          </ul>
+              )}
+            </div>
+          ) : (
+            <div style={{ color: "red", fontWeight: 600 }}>
+              ❌ {result.error || "Analysis failed or server returned error."}
+            </div>
+          )}
         </div>
       )}
+
+      <div style={{ marginTop: 12, color: "#666" }}>
+        <small>Note: Backend must run at <code>http://localhost:4000</code> and accept <code>/upload-resume</code>.</small>
+      </div>
     </div>
   );
-}
+};
+
+export default ResumeUploader;

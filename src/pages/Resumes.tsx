@@ -4,7 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader } from '@/components/ui/card';
 import {
-  Plus, FileText, Mail, Phone, MapPin,
+  FileText, Mail, Phone, MapPin,
   CheckCircle2, Undo2, XCircle, CheckSquare, Eye, Columns
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
@@ -12,6 +12,7 @@ import { useToast } from '@/hooks/use-toast';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { logActivity } from "@/lib/activity";
+import { cn } from "@/lib/utils";
 
 type Stage = 'new' | 'reviewed' | 'shortlisted' | 'rejected';
 
@@ -38,7 +39,9 @@ const stageColors: Record<Stage, string> = {
 };
 
 const PAGE_SIZE = 12;
+const MAX_MB = 15;
 
+// ---------- helpers ----------
 async function resolveFileUrl(pathOrUrl: string) {
   if (!pathOrUrl) return '';
   if (pathOrUrl.startsWith('http')) return pathOrUrl;
@@ -54,12 +57,16 @@ export default function Resumes() {
   const [filterStage, setFilterStage] =
     useState<'all' | 'new' | 'reviewed' | 'shortlisted' | 'rejected'>('all');
 
+  // queue + progress
+  const [queue, setQueue] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadedCount, setUploadedCount] = useState(0);
+
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(0);
   const [hasMore, setHasMore] = useState(true);
 
-  // debounced search
+  // search
   const [rawSearch, setRawSearch] = useState('');
   const [search, setSearch] = useState('');
 
@@ -68,7 +75,7 @@ export default function Resumes() {
   const [previewItem, setPreviewItem] = useState<Resume | null>(null);
   const [compareOpen, setCompareOpen] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dropInputRef = useRef<HTMLInputElement | null>(null);
   const { toast } = useToast();
 
   // debounce input
@@ -104,7 +111,6 @@ export default function Resumes() {
         query = query.eq('stage', filterStage);
       }
 
-      // server-side search on scalar text columns (arrays are handled client-side)
       if (search.trim() !== '') {
         const q = search.trim();
         query = query.or(
@@ -134,7 +140,7 @@ export default function Resumes() {
     await loadResumes(next);
   };
 
-  // client-side pass to include skills substring matching
+  // client-side skills search support
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return resumes;
@@ -152,7 +158,7 @@ export default function Resumes() {
     });
   }, [resumes, search]);
 
-  // bulk selections
+  // selections
   const selectedIds = Array.from(selected);
   const visibleIds = filtered.map(r => r.id);
   const hasSelection = selectedIds.length > 0;
@@ -176,7 +182,6 @@ export default function Resumes() {
     });
   };
 
-  // ---------- ACTIVITY-AWARE MUTATIONS ----------
   const refreshFirstPage = async () => {
     setPage(0);
     setResumes([]);
@@ -189,7 +194,6 @@ export default function Resumes() {
       const { error } = await supabase.from('resumes').update({ stage: newStage }).in('id', selectedIds);
       if (error) throw error;
 
-      // log activity
       await logActivity({
         entity_type: "resume",
         action: "bulk_update",
@@ -247,60 +251,139 @@ export default function Resumes() {
     }
   };
 
-  // upload
-  const onClickUpload = () => fileInputRef.current?.click();
+  // ---------- Drag & Drop + click-to-open (hidden input) ----------
+  const acceptAttr =
+    ".pdf,.doc,.docx,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain";
 
-  const onFileChosen: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const filterValid = (list: File[]) => {
+    return list.filter(f => {
+      const okSize = f.size <= MAX_MB * 1024 * 1024;
+      const nameOk = /\.(pdf|docx?|txt)$/i.test(f.name);
+      if (!okSize || !nameOk) {
+        toast({
+          variant: 'destructive',
+          title: 'Some files skipped',
+          description: `${f.name} is invalid (type/size)`,
+        });
+        return false;
+      }
+      return true;
+    });
+  };
 
-    if (file.size > 15 * 1024 * 1024) {
-      toast({ variant: 'destructive', title: 'File too large', description: 'Max 15 MB allowed.' });
-      return;
+  const getFilesFromDataTransfer = (dt: DataTransfer): File[] => {
+    const out: File[] = [];
+    if (dt.items && dt.items.length) {
+      for (let i = 0; i < dt.items.length; i++) {
+        const it = dt.items[i];
+        if (it.kind === 'file') {
+          const f = it.getAsFile();
+          if (f) out.push(f);
+        }
+      }
+    } else if (dt.files && dt.files.length) {
+      for (const f of Array.from(dt.files)) out.push(f);
     }
+    return out;
+  };
 
+  const uploadFiles = async (files: File[]) => {
+    if (!files.length) return;
     setUploading(true);
+    setUploadedCount(0);
     try {
       const { data: userData, error: userErr } = await supabase.auth.getUser();
       if (userErr || !userData?.user) throw new Error('Not authenticated');
+      const uid = userData.user.id;
 
-      const path = `${userData.user.id}/${Date.now()}_${file.name}`;
-      const upload = await supabase.storage.from(RESUME_BUCKET).upload(path, file);
-      if (upload.error) throw upload.error;
+      let done = 0;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        try {
+          const path = `${uid}/${Date.now()}_${i}_${file.name}`;
+          const upload = await supabase.storage.from(RESUME_BUCKET).upload(path, file); 
+          if (upload.error) throw upload.error;
 
-      const url = await resolveFileUrl(path);
-      const baseName = file.name.replace(/\.[^.]+$/, '');
+          const url = await resolveFileUrl(path);
+          const baseName = file.name.replace(/\.[^.]+$/, '');
 
-      const { data: inserted, error: insErr } = await supabase
-        .from('resumes')
-        .insert({
-          owner_id: userData.user.id,
-          candidate_name: baseName,
-          file_url: url,
-          stage: 'new',
-          extracted_skills: [],
-          raw_text: null,
-        })
-        .select()
-        .single();
-      if (insErr) throw insErr;
+          const { error: insErr } = await supabase.from('resumes').insert({
+            owner_id: uid,
+            candidate_name: baseName,
+            file_url: url,
+            stage: 'new',
+            extracted_skills: [],
+            raw_text: null,
+          });
+          if (insErr) throw insErr;
 
-      await logActivity({
-        entity_type: "resume",
-        entity_id: inserted.id,
-        action: "upload",
-        details: { name: baseName, size: file.size, type: file.type }
-      });
+          await logActivity({
+            entity_type: "resume",
+            action: "upload",
+            details: { name: baseName, size: file.size, type: file.type }
+          });
 
-      toast({ title: 'Resume uploaded', description: file.name });
+          done += 1;
+          setUploadedCount(done);
+        } catch (fileErr: any) {
+          console.error('Upload error:', fileErr);
+          toast({
+            variant: 'destructive',
+            title: `Upload failed: ${file.name}`,
+            description: fileErr?.message || 'Unknown error'
+          });
+        }
+      }
+      toast({ title: 'Upload complete', description: `Uploaded ${done}/${files.length} file(s).` });
+      setQueue([]);
       await refreshFirstPage();
     } catch (err: any) {
+      console.error(err);
       toast({ variant: 'destructive', title: 'Upload failed', description: err.message });
     } finally {
       setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
+
+  const [dragOver, setDragOver] = useState(false);
+
+  const onDragOverHandler = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    if (!dragOver) setDragOver(true);
+  };
+
+  const onDragLeaveHandler = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  };
+
+  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const incoming = getFilesFromDataTransfer(e.dataTransfer);
+    if (!incoming.length) {
+      toast({ title: 'No files detected', description: 'Drop PDF/DOCX/TXT files only.' });
+      return;
+    }
+    const valid = filterValid(incoming);
+    // show queue + auto-upload
+    setQueue(valid);
+    void uploadFiles(valid);
+  };
+
+  const onHiddenInputChange: React.ChangeEventHandler<HTMLInputElement> = (e) => {
+    const incoming = Array.from(e.target.files || []);
+    const valid = filterValid(incoming);
+    setQueue(valid);
+    void uploadFiles(valid);
+    if (dropInputRef.current) dropInputRef.current.value = '';
+  };
+
+  const openHiddenPicker = () => dropInputRef.current?.click();
 
   // preview & compare
   const openPreview = (r: Resume) => {
@@ -356,14 +439,54 @@ export default function Resumes() {
               Compare (2)
             </Button>
           )}
-
-          {/* Upload */}
-          <Button onClick={onClickUpload} disabled={uploading} className="rounded-full">
-            <Plus className="mr-2 h-4 w-4" />
-            Upload
-          </Button>
-          <input ref={fileInputRef} type="file" accept=".pdf,.doc,.docx,.txt" className="hidden" onChange={onFileChosen} />
         </div>
+      </div>
+
+      {/* Dropzone (click-to-open + DnD) */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={openHiddenPicker}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openHiddenPicker(); }}
+        onDragEnter={onDragOverHandler}
+        onDragOver={onDragOverHandler}
+        onDragLeave={onDragLeaveHandler}
+        onDrop={onDrop}
+        className={cn(
+          "w-full rounded-2xl border border-dashed p-6 text-center transition cursor-pointer select-none",
+          dragOver ? "border-primary bg-primary/5" : "border-muted-foreground/30"
+        )}
+      >
+        <input
+          ref={dropInputRef}
+          type="file"
+          accept={acceptAttr}
+          multiple
+          className="hidden"
+          onChange={onHiddenInputChange}
+        />
+        <p className="text-sm text-muted-foreground">Drag & drop PDF/DOCX files here (or click to choose).</p>
+        <p className="text-xs text-muted-foreground mt-1">Max {MAX_MB} MB per file • Up to 100 files</p>
+
+        {queue.length > 0 && (
+          <div className="mt-4 text-left">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-sm font-medium">
+                {uploading ? `Uploading ${uploadedCount}/${queue.length}…` : `Ready: ${queue.length} file(s)`}
+              </p>
+              {!uploading && (
+                <Button size="sm" variant="ghost" onClick={() => setQueue([])}>Clear</Button>
+              )}
+            </div>
+            <ul className="grid sm:grid-cols-2 gap-2">
+              {queue.map((f, i) => (
+                <li key={i} className="flex items-center justify-between rounded-md bg-muted/40 px-3 py-2">
+                  <span className="truncate text-sm">{f.name}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
 
       {/* Bulk Action Bar */}
@@ -403,17 +526,12 @@ export default function Resumes() {
         </div>
       )}
 
-      {/* Empty state */}
+      {/* Empty state / Grid */}
       {filtered.length === 0 ? (
         <Card className="p-10 text-center rounded-2xl border-dashed">
           <FileText className="mx-auto h-10 w-10 text-muted-foreground mb-3" />
           <p className="font-semibold text-lg">No resumes found</p>
-          <p className="text-sm text-muted-foreground">Upload a PDF or DOCX to get started.</p>
-          <div className="mt-4">
-            <Button onClick={onClickUpload} className="rounded-full">
-              <Plus className="mr-2 h-4 w-4" /> Upload
-            </Button>
-          </div>
+          <p className="text-sm text-muted-foreground">Drag & drop PDF or DOCX to get started.</p>
         </Card>
       ) : (
         <>

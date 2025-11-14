@@ -1,5 +1,5 @@
-// src/components/ResumeUploader.tsx
 import React, { useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
 
 type UploadResult = {
   success?: boolean;
@@ -10,7 +10,7 @@ type UploadResult = {
 };
 
 interface Props {
-  jdId?: string; // pass a real JD id or leave empty and replace below
+  jdId?: string;
 }
 
 const ResumeUploader: React.FC<Props> = ({ jdId }) => {
@@ -18,8 +18,7 @@ const ResumeUploader: React.FC<Props> = ({ jdId }) => {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<UploadResult | null>(null);
 
-  // If you don't pass jdId as prop, put a real JD id here (from Supabase job_descriptions table)
-  const JD_ID = jdId || "replace_with_real_jd_id_from_supabase";
+  const JD_ID = jdId || "replace_with_real_jd_id_from_jobs_table";
 
   async function handleUpload(e?: React.FormEvent) {
     if (e) e.preventDefault();
@@ -27,8 +26,8 @@ const ResumeUploader: React.FC<Props> = ({ jdId }) => {
       alert("Please select a PDF or DOCX file first.");
       return;
     }
-    if (!JD_ID || JD_ID === "replace_with_real_jd_id_from_supabase") {
-      alert("Please set a valid job description id (jdId).");
+    if (!JD_ID || JD_ID === "replace_with_real_jd_id_from_jobs_table") {
+      alert("Please set a valid job id (jdId) from the jobs table.");
       return;
     }
 
@@ -40,12 +39,22 @@ const ResumeUploader: React.FC<Props> = ({ jdId }) => {
       setLoading(true);
       setResult(null);
 
-      const resp = await fetch("http://localhost:4000/upload-resume", {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        setResult({ error: "Please sign in to upload resumes." });
+        setLoading(false);
+        return;
+      }
+
+      const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:4000";
+      const resp = await fetch(`${backendUrl}/upload-resume`, {
         method: "POST",
+        headers: {
+          "Authorization": `Bearer ${session.access_token}`,
+        },
         body: fd,
       });
 
-      // If server returned non-JSON, this may throw — handle gracefully
       const data = await resp.json();
       setResult(data);
     } catch (err) {

@@ -1,9 +1,6 @@
-// server.js
-const cors = require('cors');
-app.use(cors());
-
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const pdf = require('pdf-parse');
@@ -12,9 +9,11 @@ const { createClient } = require('@supabase/supabase-js');
 const natural = require('natural');
 const path = require('path');
 
-const upload = multer({ dest: 'tmp/' });
 const app = express();
+app.use(cors());
 app.use(express.json());
+
+const upload = multer({ dest: 'tmp/' });
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -65,54 +64,83 @@ app.post('/upload-resume', upload.single('resume'), async (req, res) => {
     // 1) extract text locally
     const extractedText = await extractTextFromFile(file.path, file.originalname);
 
-    // 2) fetch JD from Supabase
+    // 2) fetch JD from Supabase (using 'jobs' table)
     const { data: jdRows, error: jdError } = await supabase
-      .from('job_descriptions')
-      .select('description, keywords')
+      .from('jobs')
+      .select('jd_text, required_skills')
       .eq('id', jd_id)
-      .limit(1)
-      .single();
+      .maybeSingle();
 
     if (jdError) {
       console.error(jdError);
-      // if jd not found, respond error
-      return res.status(400).json({ error: 'Job description not found' });
+      return res.status(400).json({ error: 'Failed to fetch job description' });
     }
 
-    let jdKeywords = jdRows.keywords || [];
+    if (!jdRows) {
+      return res.status(404).json({ error: 'Job description not found' });
+    }
+
+    let jdKeywords = jdRows.required_skills || [];
     if (!jdKeywords || jdKeywords.length === 0) {
-      jdKeywords = extractKeywords(jdRows.description || '');
-      // optional: update JD row with keywords
-      await supabase.from('job_descriptions').update({ keywords: jdKeywords }).eq('id', jd_id);
+      jdKeywords = extractKeywords(jdRows.jd_text || '');
+      // optional: update job row with keywords
+      await supabase.from('jobs').update({ required_skills: jdKeywords }).eq('id', jd_id);
     }
 
     // 3) score resume
     const { score, matched } = scoreResume(extractedText, jdKeywords);
 
-    // 4) upload file to Supabase Storage
-    const fileStream = fs.createReadStream(file.path);
-    const storagePath = `resumes/${Date.now()}_${file.originalname}`;
+    // 4) get authenticated user
+    const authHeader = req.headers.authorization;
+    let userId = null;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.substring(7);
+      const { data: { user }, error: userError } = await supabase.auth.getUser(token);
+      if (!userError && user) {
+        userId = user.id;
+      }
+    }
+
+    if (!userId) {
+      fs.unlinkSync(file.path);
+      return res.status(401).json({ error: 'Unauthorized: Please provide valid authentication token' });
+    }
+
+    // 5) upload file to Supabase Storage
+    const fileBuffer = fs.readFileSync(file.path);
+    const storagePath = `${userId}/${Date.now()}_${file.originalname}`;
     const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('uploads') // create a bucket named 'uploads' in Supabase Storage
-      .upload(storagePath, file.path, { upsert: false });
+      .from('resumes')
+      .upload(storagePath, fileBuffer, {
+        contentType: file.mimetype,
+        upsert: false
+      });
 
     if (uploadError) {
       console.error('uploadError', uploadError);
-      // fallback: continue but mark file_url empty
+      fs.unlinkSync(file.path);
+      return res.status(500).json({ error: 'Failed to upload file to storage' });
     }
 
-    const publicUrl = supabase.storage.from('uploads').getPublicUrl(storagePath).publicURL;
+    const { data: { publicUrl } } = supabase.storage.from('resumes').getPublicUrl(storagePath);
 
-    // 5) save metadata to resumes table
+    // 6) extract candidate name from filename
+    const candidateName = file.originalname.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+
+    // 7) save metadata to resumes table
     const { data: insertData, error: insertError } = await supabase
       .from('resumes')
       .insert([{
+        owner_id: userId,
+        matched_job_id: jd_id,
+        candidate_name: candidateName,
         file_url: publicUrl,
-        file_name: file.originalname,
-        extracted_text: extractedText,
-        score,
-        matched_skills: matched,
-        jd_id
+        raw_text: extractedText,
+        extracted_skills: matched,
+        match_score: Math.round(score),
+        stage: 'new',
+        visibility: 'private'
       }]).select().single();
 
     // clean up tmp file
